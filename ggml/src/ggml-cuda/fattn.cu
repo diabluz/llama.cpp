@@ -159,26 +159,6 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_MUSA)
 }
 
-// The GQA optimizations require a mask shared by all Q heads of a K/V head, so they are skipped for ALiBi, no mask, per-head
-// masks (mask->ne[2] > 1), or unpadded KV. As the fused gate's ncols2 prediction it must stay identical to switch_ncols2/get_best_fattn_kernel.
-bool ggml_cuda_fattn_ext_use_gqa_opt(
-        const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V, const ggml_tensor * mask,
-        const ggml_tensor * kv_rows, const float max_bias) {
-    // same KV extent as the upstream routing predicates: with kv_rows the kernel iterates over the row list, not the cache
-    const int64_t n_kv = kv_rows ? kv_rows->ne[0] : K->ne[1];
-    bool use_gqa_opt = mask && mask->ne[2] == 1 && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
-    for (const ggml_tensor * t : {Q, K, V, mask}) {
-        if (t == nullptr || ggml_is_quantized(t->type)) {
-            continue;
-        }
-        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-            if (t->nb[i] % 16 != 0) {
-                return false;
-            }
-        }
-    }
-    return use_gqa_opt;
-}
 // The two helpers below mirror switch_ncols1's inline predicates verbatim so get_alloc_size can predict the routing (a mismatch
 // sizes the f16 scratch region wrong for fused-eligible quantized-KV ops; the GGML_CUDA_FATTN_MMA_FUSED=2 pin in case() aborts
 // on it). Keep these in sync with upstream's switch_ncols1.
@@ -886,14 +866,10 @@ static bool ggml_cuda_fattn_mma_f16_fused_q_applies(const int cc, const ggml_ten
     if ((Q->ne[0] != 128 && Q->ne[0] != 256 && Q->ne[0] != 512) || V->ne[0] != Q->ne[0]) {
         return false;
     }
-    float max_bias = 0.0f;
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
     float logit_softcap = 0.0f;
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
-    const bool use_gqa_opt = ggml_cuda_fattn_ext_use_gqa_opt(Q, K, V, dst->src[3], dst->src[5], max_bias);
-    // Mirror of switch_ncols2 (Volta's %-rules can differ but never fuse there: nstages = 0 without cp.async).
-    const int ncols2 = !use_gqa_opt ? 1 : gqa_ratio > 4 ? 8 : gqa_ratio > 2 ? 4 : gqa_ratio > 1 ? 2 : 1;
+    // The gqa-opt predicate and the ncols2 choice come from the dispatch's own helper (#32626), equal by construction.
+    const int ncols2 = ggml_cuda_flash_attn_ext_mma_f16_get_ncols2(cc, dst);
     if (ncols2 == 1) {
         return false; // general route: no fused instance there (its nstages is 0 anyway)
     }

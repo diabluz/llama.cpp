@@ -2200,9 +2200,6 @@ static __global__ void flash_attn_ext_f16(
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
-bool ggml_cuda_fattn_ext_use_gqa_opt(
-        const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V, const ggml_tensor * mask,
-        const ggml_tensor * kv_rows, const float max_bias);
 // GGML_CUDA_FATTN_MMA_FUSED: 0 disables the fused dequant path, 2 requires it where supported (routing tests), default enabled.
 static int ggml_cuda_fattn_mma_f16_fused_q_switch() {
     static const int value = []() {
@@ -2305,10 +2302,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     constexpr int ncols = ncols1 * ncols2;
 
     // Routing conditions of switch_ncols2/1 (gqa opt, gqa_ratio > 4 i.e. ncols2=8) are implied by this instantiation.
-    const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
     float max_bias;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
@@ -2406,8 +2401,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     fattn_kernel_t const fattn_kernel_ref = fattn_kernel;
     const size_t nbytes_shared_ref = nbytes_shared_total;
     // The fused route is decided after the kernel selection above: fused_q_supported consumes the sparse predicate.
+    // No gqa-opt check here: the dispatch instantiates this specialization with ncols2 > 1 only where it applied, the
+    // general route has nstages = 0, and every DKQ != DV route (e.g. 192-heads' direct switch_ncols1) fails DKQ == DV.
     const bool fused_q = ggml_cuda_fattn_mma_f16_fused_q_switch() != 0 &&
-        ggml_cuda_fattn_ext_use_gqa_opt(Q, K, V, mask, dst->src[5], max_bias) &&
         ggml_cuda_fattn_mma_f16_fused_q_supported(K, V, DKQ, DV, ncols2, nstages, use_sparse, logit_softcap != 0.0f);
     const int fused_K = fused_q ? ggml_cuda_fattn_mma_fused_type_from_ggml(K->type) : FATTN_MMA_FUSED_NONE;
     const int fused_V = fused_q ? ggml_cuda_fattn_mma_fused_type_from_ggml(V->type) : FATTN_MMA_FUSED_NONE;
